@@ -1,15 +1,15 @@
 [package]
 name = "in_place_map"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Vinyl <v@vinl.dev>"]
 edition = "2021"
 rust-version = "1.81.0"
 description = """Converting between containers of different element types, \
                  reusing allocation if possible, AKA \"map in place\"."""
 readme = "README.md"
-repository = "https://github.com/nylvim/map-in-place"
+repository = "https://github.com/nylvim/in-place-map"
 license = "MPL-2.0"
-keywords = ["collections", "in-place", "mapping", "memory"]
+keywords = ["collections", "in-place", "mapping", "vec"]
 categories = ["rust-patterns", "memory-management"]
 
 [dependencies]

@@ -62,8 +62,8 @@ use std::{mem, ptr, slice};
 /// implementors are encouraged to do this whenever possible.
 ///
 /// This trait also does not promise that converted elements will be written back to the original
-/// memory location, i.e. "in-place". This would be impossible for types that directly hold the
-/// elements inside, for example, arrays.
+/// memory location, i.e. strictly "in-place". This would be impossible for types that directly hold
+/// the elements inside, for example, arrays.
 ///
 /// # Implementation limitations
 ///
@@ -72,16 +72,17 @@ use std::{mem, ptr, slice};
 /// original location is usually unviable. This can be ensured at compile-time by custom
 /// implementations using the [`assert_in_place_compatible`] function.
 ///
-/// However, if the container can tolerate excess capacity, it may also accept those types `T`
-/// whose size is a multiple of `U`'s. In this case use the [`assert_reuse_compatible`] function.
+/// However, if the container tolerates excess capacity, it may also accept those types `T` whose
+/// size is greater than `U`'s. In this case use the [`assert_reuse_compatible`] function. Check its
+/// documentation for more details.
 pub trait MapInPlace<T, U>: Sized {
     /// The output type, usually the same container type, but with its element type changed to `U`.
     type Output;
 
-    /// Attempt to map the container in-place.
+    /// Attempt to map the container, reusing allocation if possible.
     fn try_map_in_place<E>(self, f: impl FnMut(T) -> Result<U, E>) -> Result<Self::Output, E>;
 
-    /// Map the container in-place.
+    /// Map the container, reusing allocation if possible.
     #[inline]
     fn map_in_place(self, f: impl FnMut(T) -> U) -> Self::Output {
         let mut f = f;
@@ -97,7 +98,7 @@ pub trait MapInPlace<T, U>: Sized {
 ///
 /// See [`MapInPlace`]'s documentation for more details.
 pub trait FilterMapInPlace<T, U>: MapInPlace<T, U> {
-    /// Filter and map a collection in-place.
+    /// Filter and map a collection, reusing allocation if possible.
     fn filter_map_in_place(self, f: impl FnMut(T) -> Option<U>) -> Self::Output;
 }
 
@@ -120,23 +121,23 @@ pub const fn assert_in_place_compatible<T, U>() {
 /// store values of type `U`.
 ///
 /// This is true when `U` is zero-sized, or when `T` and `U` have the same alignment and `T`'s size
-/// is a multiple of, and not smaller than, `U`'s size. Otherwise reusing memory is unviable.
+/// is not smaller than `U`'s size. Otherwise reusing memory is unviable.
 ///
-/// However, if `U` is ZST, this is always possible, as ZSTs don't take any space at all. In this
-/// case, implementors should free the original allocation.
+/// If `U` is zero-sized, this is always true, as ZSTs don't take any space at all. In this case,
+/// the original allocation should be freed.
+///
+/// If `T`'s size is not a multiple of `U`'s, the collection might need to shrink or expand its
+/// capacity, or allocate some new memory. For example, the allocation of a `Vec<[u8; 3]>` with
+/// capacity 3 could not be directly reused for a `Vec<[u8; 2]>`.
 ///
 /// This function is exposed for the convenience of implementing [`MapInPlace`] for custom types; it
 /// guarantees compile-time checking even when called outside a `const` context.
 #[inline(always)]
 pub const fn assert_reuse_compatible<T, U>() {
     const {
-        let (t_size, u_size) = (size_of::<T>(), size_of::<U>());
+        assert!(size_of::<T>() >= size_of::<U>(), "`T`'s size must not be smaller than `U`'s");
         assert!(
-            u_size == 0 || (t_size >= u_size && t_size % u_size == 0),
-            "`T`'s size must be a multiple of, and not smaller than `U`'s"
-        );
-        assert!(
-            u_size == 0 || align_of::<T>() == align_of::<U>(),
+            size_of::<U>() == 0 || align_of::<T>() == align_of::<U>(),
             "types must have the same alignment"
         );
     }
@@ -160,6 +161,7 @@ impl<T, U> MapInPlace<T, U> for Option<T> {
 
 impl<T, U> FilterMapInPlace<T, U> for Option<T> {
     /// Equivalent to [`Option::and_then`].
+    #[inline]
     fn filter_map_in_place(self, f: impl FnOnce(T) -> Option<U>) -> Option<U> {
         self.and_then(f)
     }
@@ -280,7 +282,7 @@ impl<T, U, const N: usize> MapInPlace<T, U> for [T; N] {
     /// Equivalent to
     /// [`<[T; N]>::map`](https://doc.rust-lang.org/stable/std/primitive.array.html#method.map).
     #[inline]
-    fn map_in_place(self, f: impl FnMut(T) -> U) -> Self::Output {
+    fn map_in_place(self, f: impl FnMut(T) -> U) -> [U; N] {
         self.map(f)
     }
 }
@@ -291,7 +293,7 @@ fn vec_helper<T, U, E>(
 ) -> Result<Vec<U>, E> {
     assert_reuse_compatible::<T, U>();
 
-    if size_of::<U>() == 0 {
+    if size_of::<U>() == 0 || this.capacity() * size_of::<T>() % size_of::<U>() != 0 {
         return this.into_iter().filter_map(f).collect();
     }
 
@@ -365,29 +367,57 @@ fn vec_helper<T, U, E>(
 impl<T, U> MapInPlace<T, U> for Vec<T> {
     type Output = Vec<U>;
 
+    /// Attempt to map the vector, reusing allocation if possible.
+    ///
+    /// If `T`'s size is not a multiple of `U`, this may allocate new memory.
     #[inline]
     fn try_map_in_place<E>(self, mut f: impl FnMut(T) -> Result<U, E>) -> Result<Vec<U>, E> {
-        vec_helper(self, |x| Some(f(x)))
+        vec_helper(self, move |x| Some(f(x)))
+    }
+
+    /// Map the vector, reusing allocation if possible.
+    ///
+    /// If `T`'s size is not a multiple of `U`, this may allocate new memory.
+    #[inline]
+    fn map_in_place(self, mut f: impl FnMut(T) -> U) -> Vec<U> {
+        vec_helper::<T, U, Infallible>(self, move |x| Some(Ok(f(x)))).unwrap()
     }
 }
 
 impl<T, U> FilterMapInPlace<T, U> for Vec<T> {
+    /// Filter and map the vector, reusing allocation if possible.
+    ///
+    /// If `T`'s size is not a multiple of `U`, this may allocate new memory.
     #[inline]
     fn filter_map_in_place(self, mut f: impl FnMut(T) -> Option<U>) -> Vec<U> {
-        vec_helper::<T, U, Infallible>(self, |x| f(x).map(Ok)).unwrap()
+        vec_helper::<T, U, Infallible>(self, move |x| f(x).map(Ok)).unwrap()
     }
 }
 
 impl<T, U> MapInPlace<T, U> for VecDeque<T> {
     type Output = VecDeque<U>;
 
+    /// Attempt to map the deque, reusing allocation if possible.
+    ///
+    /// If `T`'s size is not a multiple of `U`, this may allocate new memory.
     #[inline]
     fn try_map_in_place<E>(self, f: impl FnMut(T) -> Result<U, E>) -> Result<VecDeque<U>, E> {
         Vec::from(self).try_map_in_place(f).map(Into::into)
     }
+
+    /// Map the deque, reusing allocation if possible.
+    ///
+    /// If `T`'s size is not a multiple of `U`, this may allocate new memory.
+    #[inline]
+    fn map_in_place(self, f: impl FnMut(T) -> U) -> VecDeque<U> {
+        Vec::from(self).map_in_place(f).into()
+    }
 }
 
 impl<T, U> FilterMapInPlace<T, U> for VecDeque<T> {
+    /// Filter and map the deque, reusing allocation if possible.
+    ///
+    /// If `T`'s size is not a multiple of `U`, this may allocate new memory.
     #[inline]
     fn filter_map_in_place(self, f: impl FnMut(T) -> Option<U>) -> VecDeque<U> {
         Vec::from(self).filter_map_in_place(f).into()
@@ -397,17 +427,21 @@ impl<T, U> FilterMapInPlace<T, U> for VecDeque<T> {
 impl<T, U: Ord> MapInPlace<T, U> for BinaryHeap<T> {
     type Output = BinaryHeap<U>;
 
-    /// Attempt to map the heap while reusing allocation.
+    /// Attempt to map the heap, reusing allocation if possible.
     ///
     /// This will rebuild the heap, and has *O*(*n*) time complexity.
+    ///
+    /// If `T`'s size is not a multiple of `U`, this may allocate new memory.
     #[inline]
     fn try_map_in_place<E>(self, f: impl FnMut(T) -> Result<U, E>) -> Result<BinaryHeap<U>, E> {
         Vec::from(self).try_map_in_place(f).map(Into::into)
     }
 
-    /// Map the heap while reusing allocation.
+    /// Map the heap, reusing allocation if possible.
     ///
     /// This will rebuild the heap, and has *O*(*n*) time complexity.
+    ///
+    /// If `T`'s size is not a multiple of `U`, this may allocate new memory.
     #[inline]
     fn map_in_place(self, f: impl FnMut(T) -> U) -> BinaryHeap<U> {
         Vec::from(self).map_in_place(f).into()
@@ -415,9 +449,11 @@ impl<T, U: Ord> MapInPlace<T, U> for BinaryHeap<T> {
 }
 
 impl<T, U: Ord> FilterMapInPlace<T, U> for BinaryHeap<T> {
-    /// Filter and map the heap while reusing allocation.
+    /// Filter and map the heap, reusing allocation if possible.
     ///
     /// This will rebuild the heap, and has *O*(*n*) time complexity.
+    ///
+    /// If `T`'s size is not a multiple of `U`, this may allocate new memory.
     #[inline]
     fn filter_map_in_place(self, f: impl FnMut(T) -> Option<U>) -> BinaryHeap<U> {
         Vec::from(self).filter_map_in_place(f).into()
@@ -453,8 +489,8 @@ impl<'a, T: Clone, U> MapInPlace<Cow<'a, T>, U> for Cow<'a, [T]> {
     ) -> Result<Vec<U>, E> {
         match self {
             // collecting to `Result<Vec>` is short-circuit
-            Self::Borrowed(slice) => slice.iter().map(|x| f(Cow::Borrowed(x))).collect(),
-            Self::Owned(vec) => vec.try_map_in_place(|x| f(Cow::Owned(x))),
+            Self::Borrowed(slc) => slc.iter().map(move |x| f(Cow::Borrowed(x))).collect(),
+            Self::Owned(vec) => vec.try_map_in_place(move |x| f(Cow::Owned(x))),
         }
     }
 
@@ -464,8 +500,8 @@ impl<'a, T: Clone, U> MapInPlace<Cow<'a, T>, U> for Cow<'a, [T]> {
     #[inline]
     fn map_in_place(self, mut f: impl FnMut(Cow<'a, T>) -> U) -> Vec<U> {
         match self {
-            Self::Borrowed(slice) => slice.iter().map(|x| f(Cow::Borrowed(x))).collect(),
-            Self::Owned(vec) => vec.map_in_place(|x| f(Cow::Owned(x))),
+            Self::Borrowed(slc) => slc.iter().map(move |x| f(Cow::Borrowed(x))).collect(),
+            Self::Owned(vec) => vec.map_in_place(move |x| f(Cow::Owned(x))),
         }
     }
 }
@@ -477,8 +513,8 @@ impl<'a, T: Clone, U> FilterMapInPlace<Cow<'a, T>, U> for Cow<'a, [T]> {
     #[inline]
     fn filter_map_in_place(self, mut f: impl FnMut(Cow<'a, T>) -> Option<U>) -> Vec<U> {
         match self {
-            Self::Borrowed(slice) => slice.iter().filter_map(|x| f(Cow::Borrowed(x))).collect(),
-            Self::Owned(vec) => vec.filter_map_in_place(|x| f(Cow::Owned(x))),
+            Self::Borrowed(slc) => slc.iter().filter_map(move |x| f(Cow::Borrowed(x))).collect(),
+            Self::Owned(vec) => vec.filter_map_in_place(move |x| f(Cow::Owned(x))),
         }
     }
 }
@@ -489,8 +525,10 @@ macro_rules! impl_smart_pointer {(
     $helper_fn:ident,
     $self_name:ident,
     $pre_into_raw:expr;
-    $($doc1:literal)?,
-    $($doc2:literal)? $(,)?
+    $($doc1:expr)?,
+    $($doc2:expr)?,
+    $($doc3:expr)?,
+    $($doc4:expr)? $(,)?
 ) => {
     fn $helper_fn<T: $($t_bounds)?, U, E>(
         this: $ptr_ty<T>,
@@ -548,6 +586,7 @@ macro_rules! impl_smart_pointer {(
     impl<T: $($t_bounds)?, U> MapInPlace<T, U> for $ptr_ty<[T]> {
         type Output = $ptr_ty<[U]>;
 
+        $(#[doc = $doc3])?
         fn try_map_in_place<E>(
             self,
             mut f: impl FnMut(T) -> Result<U, E>
@@ -613,58 +652,51 @@ macro_rules! impl_smart_pointer {(
                 Ok($ptr_ty::from_raw(slice))
             }
         }
+
+        $(#[doc = $doc4])?
+        fn map_in_place(self, mut f: impl FnMut(T) -> U) -> $ptr_ty<[U]> {
+            self.try_map_in_place::<Infallible>(move |x| Ok(f(x))).unwrap()
+        }
     }
 };}
+
+macro_rules! rc_arc_doc {
+    ($ptr_ty:literal, $how_to_map:literal, $inner_ty:literal $(, $func:literal)?) => {
+        concat!(
+            $how_to_map, " the ", $inner_ty, " in an `", $ptr_ty,
+            "`, reusing the allocation if possible.\n\nIf there are other `", $ptr_ty,
+            "` pointers to the same allocation, then this will clone the inner ", $inner_ty,
+            " to a new allocation before mapping.\n\nHowever, if there are no other `", $ptr_ty,
+            "` pointers to this allocation, but some `Weak` pointers, then the `Weak` pointers \
+             will be disassociated and the inner ", $inner_ty,
+            " will not be cloned, but moved to a new allocation.",
+            $("\n\nSimilar to [`", $func, "`], but `f` takes ownership of the value, and does not \
+            accept types of different sizes.")?
+        )
+    };
+}
 
 impl_smart_pointer! {
     Box, , box_helper,
     this, ();
     "Similar to [`Box::try_map`], but does not accept types of different sizes.",
-    "Similar to [`Box::map`], but does not accept types of different sizes.",
+    "Similar to [`Box::map`], but does not accept types of different sizes.", ,
 }
 
 impl_smart_pointer! {
     Rc, Clone, rc_helper,
     this, Rc::make_mut(&mut this);
-
-    "Attempt to map the value in an `Rc`, reusing the allocation if possible.\n\n\
-    If there are other `Rc` pointers to the same allocation, then this will clone \
-    the inner value to a new allocation before mapping.\n\n\
-    However, if there are no other `Rc` pointers to this allocation, but some `Weak` \
-    pointers, then the `Weak` pointers will be disassociated and the inner value will \
-    not be cloned, but moved to a new allocation.\n\n\
-    Similar to [`Rc::try_map`], but `f` takes ownership of the value, and does not \
-    accept types of different sizes.",
-
-    "Attempt to map the value in an `Rc`, reusing the allocation if possible.\n\n\
-    If there are other `Rc` pointers to the same allocation, then this will clone \
-    the inner value to a new allocation before mapping.\n\n\
-    However, if there are no other `Rc` pointers to this allocation, but some `Weak` \
-    pointers, then the `Weak` pointers will be disassociated and the inner value will \
-    not be cloned, but moved to a new allocation.\n\n\
-    Similar to [`Rc::map`], but `f` takes ownership of the value, and does not \
-    accept types of different sizes.",
+    rc_arc_doc!("Rc", "Attempt to map", "value", "Rc::try_map"),
+    rc_arc_doc!("Rc", "Map", "value", "Rc::map"),
+    rc_arc_doc!("Rc", "Attempt to map", "slice"),
+    rc_arc_doc!("Rc", "Map", "slice"),
 }
 
 impl_smart_pointer! {
     Arc, Clone, arc_helper,
     this, Arc::make_mut(&mut this);
-
-    "Attempt to map the value in an `Arc`, reusing the allocation if possible.\n\n\
-    If there are other `Arc` pointers to the same allocation, then this will clone \
-    the inner value to a new allocation before mapping.\n\n\
-    However, if there are no other `Arc` pointers to this allocation, but some `Weak` \
-    pointers, then the `Weak` pointers will be disassociated and the inner value will \
-    not be cloned, but moved to a new allocation.\n\n\
-    Similar to [`Arc::try_map`], but `f` takes ownership of the value, and does not \
-    accept types of different sizes.",
-
-    "Attempt to map the value in an `Arc`, reusing the allocation if possible.\n\n\
-    If there are other `Arc` pointers to the same allocation, then this will clone \
-    the inner value to a new allocation before mapping.\n\n\
-    However, if there are no other `Arc` pointers to this allocation, but some `Weak` \
-    pointers, then the `Weak` pointers will be disassociated and the inner value will \
-    not be cloned, but moved to a new allocation.\n\n\
-    Similar to [`Arc::map`], but `f` takes ownership of the value, and does not \
-    accept types of different sizes.",
+    rc_arc_doc!("Arc", "Attempt to map", "value", "Arc::try_map"),
+    rc_arc_doc!("Arc", "Map", "value", "Arc::map"),
+    rc_arc_doc!("Arc", "Attempt to map", "slice"),
+    rc_arc_doc!("Arc", "Map", "slice"),
 }
